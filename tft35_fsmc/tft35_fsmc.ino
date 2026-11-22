@@ -1964,10 +1964,10 @@ static bool grPow = false;                                     // true = все 
 static String gMsg = "", grLastVals;
 static unsigned long gMsgMs = 0;
 
-#define GP_X 38
-#define GP_Y 50
-#define GP_W 432
-#define GP_H 172
+#define GP_X 30
+#define GP_Y 48
+#define GP_W 440
+#define GP_H 200
 #define GR_BT_Y 268
 #define GR_RANGE_X 118                                        // кнопка интервала: рядом с Back, внизу
 
