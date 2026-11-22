@@ -70,7 +70,7 @@ static const float GPU2_TEMP_WARN = 75.0;   // температура Ti 2: жё
 static const float GPU2_TEMP_CRIT = 85.0;   //                 красная от
 static const float GPU1_PWR_LIM   = 260.0;  // лимит мощности Ti 1, Вт
 static const float GPU2_PWR_LIM   = 260.0;  // лимит мощности Ti 2, Вт
-static const float PSUM_LIM       = 800.0;  // ориентир суммарной мощности (БП), Вт
+static const float PSUM_LIM       = 850.0;  // лимит блока питания: потолок шкалы мощности и база для %, Вт
 static const float DEF_TEMP_WARN  = 65.0;   // пороги остальных датчиков (CPU, SSD)
 static const float DEF_TEMP_CRIT  = 80.0;
 
@@ -1119,6 +1119,28 @@ static void drawPageDots() {                   // точки страниц сл
   }
 }
 
+// ---- иконка Wi-Fi в шапке (по RSSI из ответов GETCFG на ESP; дисплей спрашивает CFG раз в 10 с)
+static uint8_t wifiIcoSig = 0xFF;              // 0xFF = перерисовать в любом случае
+static void wifiIconDraw() {
+  bool alive = espCfgMs != 0 && millis() - espCfgMs < 15000 && espWifi == 1;
+  uint8_t bars = 0; uint16_t col = C_GREY;
+  if (alive) {
+    bars = (espRssi >= -55) ? 4 : (espRssi >= -65) ? 3 : (espRssi >= -75) ? 2 : 1;
+    col = (bars >= 3) ? C_GREEN : (bars == 2 ? C_YELLOW : C_RED);
+  }
+  uint8_t sig = bars | (col == C_GREEN ? 0x10 : col == C_YELLOW ? 0x20 : col == C_RED ? 0x30 : (uint8_t)0x00);
+  if (!forceRedraw && sig == wifiIcoSig) return;
+  wifiIcoSig = sig;
+  const int16_t ix = 246, iy = 28;             // 4 столбика вверх от iy, высотой 4/8/12/16
+  tft.fillRect(ix - 2, iy - 18, 26, 20, C_BLACK);
+  for (uint8_t b = 0; b < 4; b++) {
+    int16_t h = 4 + b * 4;
+    int16_t x = ix + b * 5;
+    if (b < bars) tft.fillRect(x, iy - h, 3, h, col);
+    else tft.drawRect(x, iy - h, 3, h, C_GREY);
+  }
+}
+
 static void drawClock() {                      // время и дата в шапке (вместо надписи Server Monitor)
   int yr = 0, mo = 1, d = 1, hh = 0, mi = 0, ss = 0, wd = 0;
   String sig = "--";
@@ -1126,16 +1148,18 @@ static void drawClock() {                      // время и дата в ша
     epochToDate(nowLocal(), yr, mo, d, hh, mi, ss, wd);
     sig = two(hh) + ":" + two(mi) + " " + String(wd) + "," + String(d) + "," + String(mo);
   }
-  if (!forceRedraw && sig == clockSig) return;
+  if (!forceRedraw && sig == clockSig) { wifiIconDraw(); return; }
   clockSig = sig;
   tft.fillRect(10, 6, 272, 46, C_BLACK);
+  wifiIcoSig = 0xFF;                           // заливка стёрла иконку - перерисовать
   tft.setTextSize(4);
   tft.setCursor(16, 12);
-  if (!clkValid()) { tft.setTextColor(C_GREY, C_BLACK); tft.print("--:--"); return; }
+  if (!clkValid()) { tft.setTextColor(C_GREY, C_BLACK); tft.print("--:--"); wifiIconDraw(); return; }
   tft.setTextColor(C_WHITE, C_BLACK); tft.print(two(hh) + ":" + two(mi));
   tft.setTextSize(2); tft.setTextColor(C_GREY, C_BLACK);
   tft.setCursor(156, 12); tft.print(WD_NAME[wd]);
   tft.setCursor(156, 32); tft.print(String(d) + " " + MO_NAME[mo - 1]);
+  wifiIconDraw();
 }
 
 void drawStatic() {
@@ -1268,25 +1292,33 @@ static void drawValues2() {
   pollEsp();
 }
 
-// ---- 3-я страница: мощность. Значение, % от лимита (для SUM/GPU) или пик (CPU/DRAM), справа микрографик
-static const float PLIM[5] = {PSUM_LIM, 0, 0, GPU1_PWR_LIM, GPU2_PWR_LIM};   // 0 = лимита нет (CPU, DRAM)
+// ---- 3-я страница: мощность. Значение, % от бюджета БП (PSUM_LIM) для всех строк, справа микрографик.
+//      Красный = превышен свой лимит (SUM - PSUM_LIM, GPU - свои PWR_LIM).
 static const uint16_t POW_SPARK_COL[5] = {C_RED, C_YELLOW, C_GREY, C_CYAN, C_ORANGE};
+
+static bool powOver(uint8_t k, float w) {
+  if (k == 0) return PSUM_LIM > 0 && w > PSUM_LIM;
+  if (k == 3) return GPU1_PWR_LIM > 0 && w > GPU1_PWR_LIM;
+  if (k == 4) return GPU2_PWR_LIM > 0 && w > GPU2_PWR_LIM;
+  return false;
+}
 
 static void drawValues3() {
   for (uint8_t k = 0; k < 5; k++) {
     bool fresh = pAt[k] != 0 && millis() - pAt[k] <= X_STALE_MS;
-    String v = "--", mid = "";
-    if (fresh) v = (pV[k] < 10.0f) ? (String(pV[k], 1) + " W") : (String((int)(pV[k] + 0.5f)) + " W");
-    bool over = fresh && PLIM[k] > 0 && pV[k] > PLIM[k];
+    String v = "--", mid = "--";
+    if (fresh) {
+      v = (pV[k] < 10.0f) ? (String(pV[k], 1) + " W") : (String((int)(pV[k] + 0.5f)) + " W");
+      int mp = (PSUM_LIM > 0) ? (int)(pV[k] * 100.0f / PSUM_LIM + 0.5f) : -1;
+      if (mp > 999) mp = 999;
+      if (mp >= 0) mid = String(mp) + "%";
+    }
+    bool over = fresh && powOver(k, pV[k]);
     uint16_t col = fresh ? (over ? C_RED : C_CYAN) : C_GREY;
     uint16_t mcol = C_GREY;
-    if (PLIM[k] > 0) {                                    // % от лимита
-      int mp = fresh ? (int)(pV[k] * 100.0f / PLIM[k] + 0.5f) : -1;
-      if (mp > 999) mp = 999;
-      mid = (mp < 0) ? String("--") : (String(mp) + "%");
-      mcol = !fresh ? C_GREY : (over ? C_RED : (mp >= 90 ? C_YELLOW : C_CYAN));
-    } else if (fresh) {                                   // пик с момента включения дисплея
-      mid = "pk " + String((int)(pMax[k] + 0.5f)) + "W";
+    if (fresh) {
+      int mp = (PSUM_LIM > 0) ? (int)(pV[k] * 100.0f / PSUM_LIM + 0.5f) : 0;
+      mcol = over ? C_RED : (mp >= 90 ? C_YELLOW : C_CYAN);
     }
     String key = v + "|" + mid + "|" + String((int)col) + String((int)mcol);
     if (forceRedraw || key != lastP[k]) {
@@ -1939,17 +1971,16 @@ static unsigned long gMsgMs = 0;
 #define GR_BT_Y 268
 #define GR_RANGE_X 118                                        // кнопка интервала: рядом с Back, внизу
 
-// шкала мощности на графике: потолок, Вт (сетка 125 / 250 / 375)
-#define GP_WATTS_MAX 500
+// шкала мощности на графике: авто-подстройка по максимуму окна, потолок - PSUM_LIM (БП)
+static uint16_t grTopW = (uint16_t)PSUM_LIM;      // верх шкалы, Вт (пересчитывается в grPlot)
 
 static int16_t grPx(int i, int n) { return GP_X + (int16_t)((long)i * (GP_W - 1) / (n - 1)); }
 static int16_t grPy(uint8_t e) {
   if (e > 200) e = 200;
   return GP_Y + GP_H - 1 - (int16_t)((long)e * (GP_H - 1) / 200);
 }
-static int16_t grPyW(uint8_t e) {                              // мощность из истории (байт = Вт * 0.5)
-  uint16_t w2 = e;                                             // 0..254 = 0..508 Вт
-  return GP_Y + GP_H - 1 - (int16_t)((long)w2 * (GP_H - 1) / (GP_WATTS_MAX * 2));
+static int16_t grPyW(uint8_t e) {                             // мощность из истории (байт = Вт * 0.5)
+  return GP_Y + GP_H - 1 - (int16_t)((long)e * 2 * (GP_H - 1) / (long)grTopW);
 }
 
 static void grPlot() {
@@ -1958,7 +1989,20 @@ static void grPlot() {
   uint8_t lv = GR_LV[grRange];
   uint16_t n = GR_N[grRange];
   if (grPow) {
-    for (int g = 1; g <= 3; g++) tft.drawFastHLine(GP_X, GP_Y + GP_H - 1 - (int32_t)g * (GP_WATTS_MAX / 4) * 2 * (GP_H - 1) / (GP_WATTS_MAX * 2), GP_W, 0x2104);   // сетка 125/250/375 Вт
+    // вертикальная шкала: максимум видимого окна, округлённый вверх до 25 Вт, потолок - PSUM_LIM
+    uint8_t mx = 0;
+    for (uint16_t i = 0; i < n; i++)
+      for (uint8_t sr = 0; sr < 5; sr++) {
+        uint8_t e = histGet(lv, n - 1 - i, (uint8_t)(POW_HIST_FIRST + sr));
+        if (e != 255 && e > mx) mx = e;
+      }
+    uint16_t topW = mx * 2;                                   // максимум окна, Вт
+    if (topW < 100) topW = 100;
+    topW = (uint16_t)((topW + 24) / 25 * 25);
+    if (topW > (uint16_t)PSUM_LIM) topW = (uint16_t)PSUM_LIM;
+    grTopW = topW;
+    for (int g = 1; g <= 3; g++)                              // сетка на четвертях шкалы
+      tft.drawFastHLine(GP_X, GP_Y + GP_H - 1 - (int16_t)((long)g * (topW / 4) * (GP_H - 1) / topW), GP_W, 0x2104);
     static const uint16_t PCL[5] = {C_RED, C_YELLOW, C_GREY, C_CYAN, C_ORANGE};
     for (uint8_t sr = 0; sr < 5; sr++) {
       int16_t px = 0, py = 0;
@@ -2024,8 +2068,8 @@ static void grDrawYAxis() {                      // подписи шкалы: %
   tft.setTextSize(1); tft.setTextColor(C_GREY, C_BLACK);
   tft.fillRect(0, GP_Y - 10, 36, GP_H + 12, C_BLACK);
   if (grPow) {
-    tft.setCursor(4, GP_Y - 2);             tft.print(GP_WATTS_MAX);
-    tft.setCursor(4, GP_Y + GP_H / 2 - 4);  tft.print(GP_WATTS_MAX / 2);
+    tft.setCursor(4, GP_Y - 2);             tft.print(grTopW);
+    tft.setCursor(4, GP_Y + GP_H / 2 - 4);  tft.print(grTopW / 2);
     tft.setCursor(20, GP_Y + GP_H - 8);     tft.print("0");
     tft.setCursor(2, GP_Y + GP_H + 6);      tft.print("W");
   } else {
@@ -2145,6 +2189,7 @@ static void graphScreen() {
     if (redraw || (int)hRev != lastRev || millis() - lastDraw > 60000UL) {
       lastRev = (int)hRev; lastDraw = millis(); redraw = false;
       grPlot(); grLabels();
+      if (grPow) grDrawYAxis();                 // авто-шкала могла смениться
     }
     grValues();
     if (!getTap(x, y)) continue;
@@ -2405,6 +2450,8 @@ static void wakeUp() {
 void loop() {
   pollEsp();
   batTick();
+  static unsigned long lastCfgReq = 0;         // RSSI для иконки Wi-Fi в шапке
+  if (millis() - lastCfgReq > 10000) { lastCfgReq = millis(); sendEsp("GETCFG"); }
 
   if (sleeping) {
     if (wakeReq || touchPressed()) {
