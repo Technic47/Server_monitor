@@ -1,5 +1,5 @@
 // =====================================================================
-//  ESP-01 (ESP8266) v2.7: опрос Prometheus + Docker + время (NTP) + мощность -> UART на дисплей TFT35
+//  ESP-01 (ESP8266) v2.8: опрос Prometheus + Docker + время (NTP) + мощность -> UART на дисплей TFT35
 //
 //  ПЛАТА В ARDUINO IDE:  Generic ESP8266 Module
 //     Flash Size: 1MB (FS:none OTA:~502KB)     <-- ВАЖНО для OTA
@@ -40,7 +40,7 @@
 #include <EEPROM.h>
 #include <time.h>
 
-#define FW_VERSION "2.7"
+#define FW_VERSION "2.8"
 
 // ---- Wi-Fi по умолчанию (нужно только для самого первого запуска; потом сеть выбирается с дисплея / из браузера)
 const char* DEF_SSID = "MTS_GPON_4DFE";
@@ -190,6 +190,8 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 static bool svcStarted = false, apOn = false;
 static unsigned long offlineSince = 0;
+static String urlEncode(const char* s);      // определён ниже, в разделе Prometheus
+static void service();                       // определён ниже
 
 static void saveSrv()  { EEPROM.put(SRV_ADDR, srv);  EEPROM.commit(); }
 static void saveWifi() { EEPROM.put(WIFI_ADDR, wifiCfg); EEPROM.commit(); }
@@ -482,7 +484,8 @@ static void handleRoot() {
                      "h3{margin-top:1.4em}.ok{color:#2a2}.bad{color:#d33}small{color:#666}</style><body>");
   page += (String("<h2>TFT Monitor ESP-01 v") + FW_VERSION + "</h2><small>IP: " + WiFi.localIP().toString() +
                      " &middot; сеть: " + he(WiFi.SSID()) + " &middot; сигнал: " + String(WiFi.RSSI()) + " dBm &middot; heap: " +
-                     String(ESP.getFreeHeap()) + " &middot; аптайм: " + String(millis() / 1000) + " с &middot; <a href='/update'>обновить прошивку</a></small>");
+                     String(ESP.getFreeHeap()) + " &middot; аптайм: " + String(millis() / 1000) + " с &middot; <a href='/update'>обновить прошивку</a>"
+                     " &middot; <a href='/export'>скачать настройки</a> &middot; <a href='/import'>загрузить настройки</a></small>");
 
   page += ("<h3>Состояние датчиков</h3><table><tr><th>Датчик<th>Состояние<th>HTTP<th>Значение<th>Давность</tr>");
   for (int i = 0; i < NT; i++) {
@@ -531,8 +534,7 @@ static void handleRoot() {
 
 static void handleSave() {
   if (!webAuth()) return;
-  String h = server.arg("host"); h.trim();
-  long p = server.arg("port").toInt();
+  String h = server.arg("host"); h.trim();  long p = server.arg("port").toInt();
   if (h.length() && h.length() < sizeof(srv.host) && p > 0 && p < 65536) {
     memset(srv.host, 0, sizeof(srv.host));
     h.toCharArray(srv.host, sizeof(srv.host));
@@ -574,6 +576,129 @@ static void handleSave() {
   backoffUntil = 0;
   server.sendHeader("Location", "/");
   server.send(303);
+}
+
+// ---------------------------------------------------------------------
+//  Экспорт / импорт настроек (текстовый файл, значения url-encoded)
+// ---------------------------------------------------------------------
+static String urlDecode(const String &s) {
+  String r;
+  for (unsigned i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '%' && i + 2 < s.length()) {
+      char h[3] = {s[i + 1], s[i + 2], 0};
+      r += (char)strtol(h, nullptr, 16); i += 2;
+    } else if (c == '+') r += ' ';
+    else r += c;
+  }
+  return r;
+}
+
+static int keyIndex(const String &k) {       // "CPU" / "LGPU1" / ... -> индекс 0..NT-1
+  for (int i = 0; i < NT; i++) if (k == keyOf(i)) return i;
+  return -1;
+}
+
+static void handleExport() {
+  if (!webAuth()) return;
+  String t;
+  t.reserve(6000);
+  t += "# TFT-Monitor ESP-01 v" FW_VERSION " - настройки. Файл содержит пароли - храни в безопасности.\n";
+  t += "SRV=" + urlEncode((String(srv.host) + ":" + String((unsigned)srv.port)).c_str()) + "\n";
+  String dkv = dk.host[0] ? (String(dk.host) + ":" + String((unsigned)dk.port)) : String("");
+  t += "DK=" + urlEncode(dkv.c_str()) + "\n";
+  t += "DKALERT=" + String((int)dk.alert) + "\n";
+  t += "TZ=" + String((int)tzc.minutes) + "\n";
+  if (wifiCfg.magic == WIFI_MAGIC && wifiCfg.ssid[0]) {          // иначе сеть из DEF_SSID, пароля в EEPROM нет
+    t += "WIFI_SSID=" + urlEncode(wifiCfg.ssid) + "\n";
+    t += "WIFI_PASS=" + urlEncode(wifiCfg.pass) + "\n";
+  }
+  for (int i = 0; i < NT; i++) {
+    t += "Q:" + String(keyOf(i)) + "=" + urlEncode(queryOf(i)) + "\n";
+    if (i < NS) t += "T:" + String(KEYS[i]) + "=" + String(sens.s[i].alertAbove, 1) + "\n";
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=esp-monitor.cfg");
+  server.send(200, "text/plain; charset=utf-8", t);
+}
+
+static void handleImportForm() {
+  if (!webAuth()) return;
+  server.send(200, "text/html; charset=utf-8", F(
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Импорт настроек</title><body style='font-family:sans-serif;max-width:780px;margin:1em auto;padding:0 1em'>"
+    "<h2>Импорт настроек</h2><p>Вставь сюда содержимое файла, скачанного со <a href='/'>страницы настроек</a> "
+    "(ссылка «скачать настройки»). Строки с ошибками будут пропущены, остальные применятся сразу и сохранятся в EEPROM. "
+    "Wi-Fi применится только если сеть найдена и пароль верный.</p>"
+    "<form method=post action=/import><textarea name=cfg rows=24 style='width:100%;box-sizing:border-box;font-family:monospace'></textarea>"
+    "<br><br><button style='padding:8px 20px;font-size:1.1em'>Применить</button> &nbsp; <a href='/'>Отмена</a></form>"));
+}
+
+static void handleImport() {
+  if (!webAuth()) return;
+  String body = server.arg("cfg");
+  String wifiImpSsid, wifiImpPass;
+  bool srvOk = false, dkOk = false, tzOk = false, qOk = false;
+  int applied = 0, skipped = 0;
+  int pos = 0;
+  while (pos <= (int)body.length()) {
+    int e = body.indexOf('\n', pos); if (e < 0) e = body.length();
+    String line = body.substring(pos, e); pos = e + 1;
+    line.trim();
+    if (!line.length() || line[0] == '#') continue;
+    int eq = line.indexOf('=');
+    if (eq < 1) { skipped++; continue; }
+    String k = line.substring(0, eq); k.trim();
+    String v = urlDecode(line.substring(eq + 1)); v.trim();
+    if (k == "SRV") {
+      int c = v.indexOf(':');
+      String h = (c < 0) ? v : v.substring(0, c);
+      long p = (c < 0) ? 9090 : v.substring(c + 1).toInt();
+      if (h.length() && h.length() < sizeof(srv.host) && p > 0 && p < 65536) {
+        memset(srv.host, 0, sizeof(srv.host)); h.toCharArray(srv.host, sizeof(srv.host));
+        srv.port = (uint16_t)p; srvOk = true; applied++;
+      } else skipped++;
+    } else if (k == "DK") {
+      if (v.length() == 0) { memset(dk.host, 0, sizeof(dk.host)); dkOk = true; applied++; }
+      else {
+        int c = v.indexOf(':');
+        String h = (c < 0) ? v : v.substring(0, c);
+        long p = (c < 0) ? DEF_DK_PORT : v.substring(c + 1).toInt();
+        if (h.length() && h.length() < sizeof(dk.host) && p > 0 && p < 65536) {
+          memset(dk.host, 0, sizeof(dk.host)); h.toCharArray(dk.host, sizeof(dk.host));
+          dk.port = (uint16_t)p; dkOk = true; applied++;
+        } else skipped++;
+      }
+    } else if (k == "DKALERT") { dk.alert = v.toInt() ? 1 : 0; dkOk = true; applied++; }
+    else if (k == "TZ") {
+      long m = v.toInt();
+      if (m >= -720 && m <= 840) { tzc.minutes = (int16_t)m; tzOk = true; applied++; } else skipped++;
+    } else if (k == "WIFI_SSID") {
+      if (v.length() && v.length() <= 32) { wifiImpSsid = v; applied++; } else skipped++;
+    } else if (k == "WIFI_PASS") {
+      if (v.length() <= 64) { wifiImpPass = v; applied++; } else skipped++;
+    } else if (k.startsWith("Q:")) {
+      int idx = keyIndex(k.substring(2));
+      if (idx >= 0 && v.length() < QLEN) { memset(queryOf(idx), 0, QLEN); v.toCharArray(queryOf(idx), QLEN); qOk = true; applied++; }
+      else skipped++;
+    } else if (k.startsWith("T:")) {
+      int idx = keyIndex(k.substring(2));
+      if (idx >= 0 && idx < NS) { sens.s[idx].alertAbove = v.toFloat(); qOk = true; applied++; }
+      else skipped++;
+    } else skipped++;
+    service();                                 // длинный файл не должен надолго блокировать опрос
+  }
+  if (srvOk) saveSrv();
+  if (dkOk) { saveDk(); dkLastPoll = 0; dkBackoffUntil = 0; }
+  if (tzOk) { saveTz(); sendTime(); }
+  if (qOk) { saveSens(); lastCheckTime = 0; backoffUntil = 0; }
+  if (wifiImpSsid.length()) startWifiChange(wifiImpSsid, wifiImpPass);
+  String p = F("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<title>Импорт</title><body style='font-family:sans-serif;max-width:780px;margin:1em auto;padding:0 1em'>"
+               "<h2>Импорт завершён</h2><p>Применено строк: ");
+  p += String(applied) + ", пропущено: " + String(skipped) + ".</p>";
+  if (wifiImpSsid.length()) p += String("<p>Wi-Fi: переключаюсь на сеть ") + he(wifiImpSsid) + " (подключение займёт до 20 с).</p>";
+  p += F("<p><a href='/'>На главную</a></p>");
+  server.send(200, "text/html; charset=utf-8", p);
 }
 
 // ---------------------------------------------------------------------
@@ -762,6 +887,9 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/export", HTTP_GET, handleExport);
+  server.on("/import", HTTP_GET, handleImportForm);
+  server.on("/import", HTTP_POST, handleImport);
   httpUpdater.setup(&server, "/update", WEB_USER, WEB_PASS);
   server.begin();
 }

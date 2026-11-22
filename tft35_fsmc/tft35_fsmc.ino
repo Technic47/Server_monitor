@@ -57,6 +57,23 @@
 #define T_MISO     PB4
 #define T_MOSI     PB5
 
+// ======================= КОНФИГ GPU (настройки отображения) =======================
+// При замене видеокарт меняется только этот блок. Подписи на экране (страницы 1 и 3,
+// кнопки графиков), температурные пороги (>= WARN - жёлтая цифра, >= CRIT - красная),
+// лимиты мощности (красная подсветка при превышении и шкала % / микрографиков).
+// PWR_LIM = 0 отключает проверку. PSUM_LIM - ориентир для суммы мощности (БП).
+static const char* GPU1_NAME = "GPU0";      // подпись 1-й видеокарты
+static const char* GPU2_NAME = "GPU1";      // подпись 2-й видеокарты
+static const float GPU1_TEMP_WARN = 75.0;   // температура Ti 1: жёлтая от
+static const float GPU1_TEMP_CRIT = 85.0;   //                 красная от
+static const float GPU2_TEMP_WARN = 75.0;   // температура Ti 2: жёлтая от
+static const float GPU2_TEMP_CRIT = 85.0;   //                 красная от
+static const float GPU1_PWR_LIM   = 260.0;  // лимит мощности Ti 1, Вт
+static const float GPU2_PWR_LIM   = 260.0;  // лимит мощности Ti 2, Вт
+static const float PSUM_LIM       = 800.0;  // ориентир суммарной мощности (БП), Вт
+static const float DEF_TEMP_WARN  = 65.0;   // пороги остальных датчиков (CPU, SSD)
+static const float DEF_TEMP_CRIT  = 80.0;
+
 // ---------- батарея (Li-ion через делитель на АЦП) ----------
 #define BAT_ENABLED     0
 #define BAT_ADC_PIN     PA0        // разъём ENCODER, делитель: + батареи -> 47к -> PA0 -> 47к -> GND, 100 нФ между PA0 и GND
@@ -732,10 +749,13 @@ static bool getTap(int16_t &x, int16_t &y) {
 
 // ======================= ИСТОРИЯ (ОЗУ) =======================
 // Запись идёт всегда, на любом экране, в трёх разрешениях: 15 с x 240 = 1 ч, 3 мин x 240 = 12 ч, 18 мин x 240 = 72 ч.
-// Ряды: 0..3 температуры (CPU, GPU0, SSD, GPU1), 4..8 нагрузка (CPU, GPU0, SSD, GPU1, RAM).
+// Ряды: 0..3 температуры (CPU, GPU0, SSD, GPU1), 4..8 нагрузка (CPU, GPU0, SSD, GPU1, RAM),
+// 9..13 мощность (PSUM, PCPU, PRAM, PGU1, PGU2) - в октets хранится Вт * POW_HIST_SCALE.
 // Значение хранится как градусы/проценты x 2 (0..254), 255 = нет данных. После перезагрузки история пустая.
 #define H_N 240
-#define H_SER 9
+#define H_SER 14
+#define POW_HIST_SCALE 0.5f                     // мощность в истории: байт = Вт * 0.5 (потолок 508 Вт, шаг 2 Вт)
+#define POW_HIST_FIRST 9                        // первый ряд мощности в истории
 #define HIST_STEP_MS 15000UL
 static uint8_t  hist[3][H_SER][H_N];
 static uint16_t hHead[3] = {0, 0, 0};            // куда писать следующий отсчёт
@@ -751,6 +771,14 @@ static uint8_t histEnc(float v) {
   if (v > 127) v = 127;
   return (uint8_t)(v * 2.0f + 0.5f);
 }
+
+// мощность: байт = Вт * POW_HIST_SCALE (0..508 Вт при 0.5), 255 = нет данных
+static uint8_t histEncPow(float w) {
+  if (w < 0) return 255;
+  if (w > 254.0f / POW_HIST_SCALE) w = 254.0f / POW_HIST_SCALE;
+  return (uint8_t)(w * POW_HIST_SCALE + 0.5f);
+}
+static float histDecPow(uint8_t e) { return (e == 255) ? -1.0f : (e / POW_HIST_SCALE); }
 
 static void histPush(uint8_t lv, const uint8_t* e) {
   for (uint8_t i = 0; i < H_SER; i++) hist[lv][i][hHead[lv]] = e[i];
@@ -776,6 +804,10 @@ static void histTick() {
   for (uint8_t i = 0; i < 5; i++) {
     bool ok = loadAt[i] != 0 && now - loadAt[i] <= VAL_STALE_MS;
     e[4 + i] = ok ? histEnc(loadV[i]) : 255;
+  }
+  for (uint8_t i = 0; i < 5; i++) {
+    bool ok = pAt[i] != 0 && now - pAt[i] <= X_STALE_MS;
+    e[POW_HIST_FIRST + i] = ok ? histEncPow(pV[i]) : 255;
   }
   histPush(0, e);
   for (uint8_t i = 0; i < H_SER; i++) if (e[i] != 255) { acc1[i] += e[i]; cnt1[i]++; }
@@ -953,21 +985,6 @@ static void icoDocker(int16_t x, int16_t y, uint16_t c) {       // стопка 
   tft.drawFastHLine(x + 1, y + 22, 26, c);
   tft.drawFastHLine(x + 5, y + 24, 18, c);
 }
-
-// ======================= КОНФИГ GPU =======================
-// При замене видеокарт меняется только этот блок: подписи на экране, температурные
-// пороги (цвет цифры: >= WARN - жёлтый, >= CRIT - красный) и лимит мощности
-// (подсветка красным на 3-й странице, если карта потребляет больше; 0 = не проверять).
-static const char* GPU1_NAME = "GPU0";      // подпись 1-й видеокарты (страницы 1 и 3)
-static const char* GPU2_NAME = "GPU1";      // подпись 2-й видеокарты
-static const float GPU1_TEMP_WARN = 75.0;   // температура Ti 1: жёлтая от
-static const float GPU1_TEMP_CRIT = 85.0;   //                 красная от
-static const float GPU2_TEMP_WARN = 75.0;   // температура Ti 2: жёлтая от
-static const float GPU2_TEMP_CRIT = 85.0;   //                 красная от
-static const float GPU1_PWR_LIM   = 260.0;  // лимит мощности Ti 1, Вт
-static const float GPU2_PWR_LIM   = 260.0;  // лимит мощности Ti 2, Вт
-static const float DEF_TEMP_WARN  = 65.0;   // пороги остальных датчиков (CPU, SSD)
-static const float DEF_TEMP_CRIT  = 80.0;
 
 // ======================= ГЛАВНЫЙ ЭКРАН =======================
 static const int16_t ROW_Y0 = 64, ROW_DY = 45;                 // 5 строк сверху вниз: CPU, RAM, GPU1, GPU2, SSD
@@ -1149,23 +1166,44 @@ static void printVal(uint8_t idx, int16_t rowY, float v) {   // printf("%f") в 
   tft.print(t);
 }
 
-static void printLoad(uint8_t idx, int16_t rowY, float v) {  // полоска + проценты; v < 0 = нет данных
-  if (loadAt[idx] == 0 || millis() - loadAt[idx] > VAL_STALE_MS) v = -1;   // устарело - пустая полоска и "--"
+// нагрузка на 1-й странице: проценты числом (полоски убраны, справа микрографик - см. sparkDraw)
+static void printLoad(uint8_t idx, int16_t rowY, float v) {  // v < 0 = нет данных
+  if (loadAt[idx] == 0 || millis() - loadAt[idx] > VAL_STALE_MS) v = -1;
   int16_t pct = (v < 0) ? -1 : (int16_t)(v + 0.5f);
   if (pct > 100) pct = 100;
   if (!forceRedraw && pct == lastLoad[idx]) return;
   lastLoad[idx] = pct;
-  const int16_t bx = 256, bw = 120, by = rowY + 4, bh = 18;
   uint16_t col = (pct < 0) ? C_GREY : loadCol(pct);
-  int16_t fw = (pct < 0) ? 0 : (int16_t)((long)(bw - 4) * pct / 100);
-  tft.drawRect(bx, by, bw, bh, C_GREY);
-  if (fw > 0) tft.fillRect(bx + 2, by + 2, fw, bh - 4, col);
-  if (fw < bw - 4) tft.fillRect(bx + 2 + fw, by + 2, bw - 4 - fw, bh - 4, C_BLACK);
   String t = (pct < 0) ? String("--") : (String((int)pct) + "%");
   while (t.length() < 4) t += ' ';
   tft.setTextSize(2); tft.setTextColor(col, C_BLACK);
-  tft.setCursor(384, rowY + 6);
+  tft.setCursor(252, rowY + 6);
   tft.print(t);
+}
+
+// микрографик из истории (уровень 0, последние ~7 мин): автомасштаб по максимуму окна
+#define SPARK_N 28
+static uint16_t sparkRev = 0;                    // по какому тику истории рисовали последний раз
+static void sparkDraw(int16_t rowY, int16_t sx, int16_t sw, uint8_t sr, uint16_t col) {
+  const int16_t sy = rowY + 4, sh = 18;
+  tft.fillRect(sx, sy, sw, sh, C_BLACK);
+  tft.drawRect(sx, sy, sw, sh, 0x2104);
+  uint8_t buf[SPARK_N], mx = 0, cnt = 0;
+  for (uint8_t i = 0; i < SPARK_N; i++) {
+    uint8_t e = histGet(0, SPARK_N - 1 - i, sr);
+    buf[i] = e;
+    if (e != 255) { if (e > mx) mx = e; cnt++; }
+  }
+  if (cnt < 2 || mx == 0) return;
+  int16_t px = 0, py = 0;
+  bool have = false;
+  for (uint8_t i = 0; i < SPARK_N; i++) {
+    if (buf[i] == 255) { have = false; continue; }
+    int16_t x = sx + 2 + (int16_t)((long)i * (sw - 5) / (SPARK_N - 1));
+    int16_t y = sy + sh - 2 - (int16_t)((long)buf[i] * (sh - 5) / mx);
+    if (have) tft.drawLine(px, py, x, y, col); else tft.drawPixel(x, y, col);
+    px = x; py = y; have = true;
+  }
 }
 
 // ---- 2-я страница: значения
@@ -1230,48 +1268,79 @@ static void drawValues2() {
   pollEsp();
 }
 
-// ---- 3-я страница: мощность
+// ---- 3-я страница: мощность. Значение, % от лимита (для SUM/GPU) или пик (CPU/DRAM), справа микрографик
+static const float PLIM[5] = {PSUM_LIM, 0, 0, GPU1_PWR_LIM, GPU2_PWR_LIM};   // 0 = лимита нет (CPU, DRAM)
+static const uint16_t POW_SPARK_COL[5] = {C_RED, C_YELLOW, C_GREY, C_CYAN, C_ORANGE};
+
 static void drawValues3() {
   for (uint8_t k = 0; k < 5; k++) {
     bool fresh = pAt[k] != 0 && millis() - pAt[k] <= X_STALE_MS;
-    String v = "--", mx = "";
-    if (fresh) {
-      v = (pV[k] < 10.0f) ? (String(pV[k], 1) + " W") : (String((int)(pV[k] + 0.5f)) + " W");
-      mx = "peak " + String((int)(pMax[k] + 0.5f)) + "W";
+    String v = "--", mid = "";
+    if (fresh) v = (pV[k] < 10.0f) ? (String(pV[k], 1) + " W") : (String((int)(pV[k] + 0.5f)) + " W");
+    bool over = fresh && PLIM[k] > 0 && pV[k] > PLIM[k];
+    uint16_t col = fresh ? (over ? C_RED : C_CYAN) : C_GREY;
+    uint16_t mcol = C_GREY;
+    if (PLIM[k] > 0) {                                    // % от лимита
+      int mp = fresh ? (int)(pV[k] * 100.0f / PLIM[k] + 0.5f) : -1;
+      if (mp > 999) mp = 999;
+      mid = (mp < 0) ? String("--") : (String(mp) + "%");
+      mcol = !fresh ? C_GREY : (over ? C_RED : (mp >= 90 ? C_YELLOW : C_CYAN));
+    } else if (fresh) {                                   // пик с момента включения дисплея
+      mid = "pk " + String((int)(pMax[k] + 0.5f)) + "W";
     }
-    uint16_t col = fresh ? C_CYAN : C_GREY;
-    if (fresh && ((k == 3 && GPU1_PWR_LIM > 0 && pV[k] > GPU1_PWR_LIM) ||
-                  (k == 4 && GPU2_PWR_LIM > 0 && pV[k] > GPU2_PWR_LIM))) col = C_RED;
-    String key = v + "|" + mx + "|" + String((int)col);
+    String key = v + "|" + mid + "|" + String((int)col) + String((int)mcol);
     if (forceRedraw || key != lastP[k]) {
       lastP[k] = key;
       int16_t ry = ROW_Y0 + k * ROW_DY;
       tft.setTextSize(3); tft.setTextColor(col, C_BLACK);
-      tft.setCursor(122, ry + 2); tft.print(padTo(v, 8));
-      tft.setTextSize(2); tft.setTextColor(C_GREY, C_BLACK);
-      tft.setCursor(290, ry + 6); tft.print(padTo(mx, 11));
+      tft.setCursor(122, ry + 2); tft.print(padTo(v, 6));
+      tft.setTextSize(2); tft.setTextColor(mcol, C_BLACK);
+      tft.setCursor(246, ry + 6); tft.print(padTo(mid, 7));
     }
     pollEsp();
   }
 }
 
-void drawValues() {
-  drawClock();
-  bool stale = (lastDataMs != 0) && (millis() - lastDataMs > DATA_STALE_MS);
-  if (curPage == 0) {
-    float tv[4] = {cpuTemp, gpuTemp, ssdTemp, p102Temp};
-    for (uint8_t i = 0; i < 5; i++) {
-      int16_t ry = ROW_Y0 + i * ROW_DY;
-      if (ROW_TEMP[i] >= 0) { printVal(ROW_TEMP[i], ry, tv[ROW_TEMP[i]]); pollEsp(); }
-      printLoad(ROW_LOAD[i], ry, loadV[ROW_LOAD[i]]); pollEsp();
-    }
-  } else if (curPage == 1) {
-    drawValues2();
-  } else {
-    drawValues3();
-  }
+// ---- статусная строка; при наличии упавших контейнеров - бегущая строка их имен
+static char badBuf[128];                          // имена контейнеров со статусами U/R/X через "; "
+static uint8_t badLen = 0;
+static uint8_t badOff = 0;
+static unsigned long badMs = 0;
+static uint16_t badRev = 0xFFFF;                  // пересобираем список при каждом новом кадре Docker
 
+static void badRebuild() {
+  badLen = 0; badBuf[0] = 0; badOff = 0;
+  if (!dkValid || dkBad <= 0 || millis() - dkMs > DK_FRESH_MS) return;
+  for (uint8_t i = 0; i < dkN && badLen < sizeof(badBuf) - 26; i++) {
+    char c = dkCode[i];
+    if (c != 'U' && c != 'R' && c != 'X') continue;
+    uint8_t n = strlen(dkName[i]);
+    if (badLen) { badBuf[badLen++] = ';'; badBuf[badLen++] = ' '; }
+    memcpy(badBuf + badLen, dkName[i], n);
+    badLen += n; badBuf[badLen] = 0;
+  }
+}
+
+static void statusDraw() {
+  bool stale = (lastDataMs != 0) && (millis() - lastDataMs > DATA_STALE_MS);
   bool errRecent = (espErrMs != 0) && (millis() - espErrMs < ERR_HOLD_MS);
+  if (badRev != dkRev) { badRev = dkRev; badRebuild(); }
+  if (badLen && !alertActive && !errRecent && !stale && !snoozeActive()) {
+    if (millis() - badMs <= 350) return;          // тик прокрутки 350 мс
+    badMs = millis();
+    uint16_t cyc = badLen + 6;                    // 6 пробелов в конце - пауза перед повтором
+    char w[27];
+    for (uint8_t i = 0; i < 26; i++) {
+      uint16_t p = (badOff + i) % cyc;
+      w[i] = (p < badLen) ? badBuf[p] : ' ';
+    }
+    w[26] = 0;
+    badOff = (uint8_t)((badOff + 1) % cyc);
+    tft.setTextSize(2); tft.setTextColor(C_ORANGE, C_BLACK);
+    tft.setCursor(30, 290); tft.print(w);
+    lastStatus = String("!") + w;                 // маркер: обычная ветка не считает это совпадением
+    return;
+  }
   String st = alertActive ? ("ALERT: " + alertText) : (errRecent ? espErrText : (stale ? String("NO DATA FROM ESP") : (snoozeActive() ? (String("OK, alerts off ") + String((snoozeUntil - millis()) / 60000UL + 1UL) + "m") : String("OK"))));
   if (forceRedraw || st != lastStatus) {
     lastStatus = st;
@@ -1283,6 +1352,32 @@ void drawValues() {
     tft.setTextColor(alertActive ? C_RED : ((errRecent || stale) ? C_YELLOW : C_GREY), C_BLACK);
     tft.print(t);
   }
+}
+
+void drawValues() {
+  drawClock();
+  if (curPage == 0) {
+    float tv[4] = {cpuTemp, gpuTemp, ssdTemp, p102Temp};
+    for (uint8_t i = 0; i < 5; i++) {
+      int16_t ry = ROW_Y0 + i * ROW_DY;
+      if (ROW_TEMP[i] >= 0) { printVal(ROW_TEMP[i], ry, tv[ROW_TEMP[i]]); pollEsp(); }
+      printLoad(ROW_LOAD[i], ry, loadV[ROW_LOAD[i]]); pollEsp();
+    }
+    if (forceRedraw || sparkRev != hRev) {                // микрографики нагрузки (~7 мин из истории)
+      sparkRev = hRev;
+      for (uint8_t i = 0; i < 5; i++) { sparkDraw(ROW_Y0 + i * ROW_DY, 306, 164, 4 + ROW_LOAD[i], C_CYAN); pollEsp(); }
+    }
+  } else if (curPage == 1) {
+    drawValues2();
+  } else {
+    drawValues3();
+    if (forceRedraw || sparkRev != hRev) {                // микрографики мощности
+      sparkRev = hRev;
+      for (uint8_t k = 0; k < 5; k++) { sparkDraw(ROW_Y0 + k * ROW_DY, 336, 134, POW_HIST_FIRST + k, POW_SPARK_COL[k]); pollEsp(); }
+    }
+  }
+
+  statusDraw();
   dkWidgetDraw();
   forceRedraw = false;
 }
@@ -1832,29 +1927,54 @@ static const uint8_t  GR_LV[7]   = {0, 0, 1, 1, 1, 2, 2};
 static const uint16_t GR_N[7]    = {120, 240, 60, 120, 240, 80, 240};
 static const char* const GR_LBL[7] = {"30m", "1h", "3h", "6h", "12h", "24h", "72h"};
 static const uint16_t GR_STEP[3] = {15, 180, 1080};            // секунд на отсчёт в каждом разрешении
-static uint8_t grSel = 0, grRange = 1;                         // grSel - строка (CPU, RAM, 1060, P102, SSD)
+static uint8_t grSel = 0, grRange = 1;                         // grSel - строка (CPU, RAM, GPU1, GPU2, SSD)
+static bool grPow = false;                                     // true = все 5 рядов мощности
 static String gMsg = "", grLastVals;
 static unsigned long gMsgMs = 0;
 
 #define GP_X 38
 #define GP_Y 50
 #define GP_W 432
-#define GP_H 156
-#define GR_RB_Y 226
+#define GP_H 172
 #define GR_BT_Y 268
+#define GR_RANGE_X 118                                        // кнопка интервала: рядом с Back, внизу
+
+// шкала мощности на графике: потолок, Вт (сетка 125 / 250 / 375)
+#define GP_WATTS_MAX 500
 
 static int16_t grPx(int i, int n) { return GP_X + (int16_t)((long)i * (GP_W - 1) / (n - 1)); }
 static int16_t grPy(uint8_t e) {
   if (e > 200) e = 200;
   return GP_Y + GP_H - 1 - (int16_t)((long)e * (GP_H - 1) / 200);
 }
+static int16_t grPyW(uint8_t e) {                              // мощность из истории (байт = Вт * 0.5)
+  uint16_t w2 = e;                                             // 0..254 = 0..508 Вт
+  return GP_Y + GP_H - 1 - (int16_t)((long)w2 * (GP_H - 1) / (GP_WATTS_MAX * 2));
+}
 
 static void grPlot() {
   tft.fillRect(GP_X, GP_Y, GP_W, GP_H, C_BLACK);
   tft.drawRect(GP_X - 1, GP_Y - 1, GP_W + 2, GP_H + 2, C_GREY);
-  for (int g = 1; g <= 3; g++) tft.drawFastHLine(GP_X, GP_Y + GP_H - 1 - g * (GP_H - 1) / 4, GP_W, 0x2104);   // сетка 25 / 50 / 75
   uint8_t lv = GR_LV[grRange];
   uint16_t n = GR_N[grRange];
+  if (grPow) {
+    for (int g = 1; g <= 3; g++) tft.drawFastHLine(GP_X, GP_Y + GP_H - 1 - (int32_t)g * (GP_WATTS_MAX / 4) * 2 * (GP_H - 1) / (GP_WATTS_MAX * 2), GP_W, 0x2104);   // сетка 125/250/375 Вт
+    static const uint16_t PCL[5] = {C_RED, C_YELLOW, C_GREY, C_CYAN, C_ORANGE};
+    for (uint8_t sr = 0; sr < 5; sr++) {
+      int16_t px = 0, py = 0;
+      bool have = false;
+      for (uint16_t i = 0; i < n; i++) {
+        uint8_t e = histGet(lv, n - 1 - i, (uint8_t)(POW_HIST_FIRST + sr));
+        if (e == 255) { have = false; continue; }               // разрыв в данных
+        int16_t x = grPx(i, n), y = grPyW(e);
+        if (have) tft.drawLine(px, py, x, y, PCL[sr]); else tft.drawPixel(x, y, PCL[sr]);
+        px = x; py = y; have = true;
+      }
+      pollEsp();
+    }
+    return;
+  }
+  for (int g = 1; g <= 3; g++) tft.drawFastHLine(GP_X, GP_Y + GP_H - 1 - g * (GP_H - 1) / 4, GP_W, 0x2104);   // сетка 25 / 50 / 75
   int8_t ts = ROW_TEMP[grSel];
   int8_t sr[2] = {(int8_t)(4 + ROW_LOAD[grSel]), ts};           // нагрузка, температура
   uint16_t cl[2] = {C_CYAN, C_ORANGE};
@@ -1886,40 +2006,80 @@ static void grLabels() {
   long range = (long)GR_N[grRange] * GR_STEP[GR_LV[grRange]];
   bool day = range >= 86400L;
   String l = grTimeLbl(range, day), m = grTimeLbl(range / 2, day), r = grTimeLbl(0, false);
-  tft.fillRect(0, 210, 480, 10, C_BLACK);
+  int16_t ly = GP_Y + GP_H + 4;
+  tft.fillRect(0, ly, 480, 10, C_BLACK);
   tft.setTextSize(1); tft.setTextColor(C_GREY, C_BLACK);
-  tft.setCursor(GP_X, 210); tft.print(l);
-  tft.setCursor(GP_X + GP_W / 2 - (int16_t)m.length() * 3, 210); tft.print(m);
-  tft.setCursor(GP_X + GP_W - (int16_t)r.length() * 6, 210); tft.print(r);
+  tft.setCursor(GP_X, ly); tft.print(l);
+  tft.setCursor(GP_X + GP_W / 2 - (int16_t)m.length() * 3, ly); tft.print(m);
+  tft.setCursor(GP_X + GP_W - (int16_t)r.length() * 6, ly); tft.print(r);
 }
 
+// 6 кнопок в ряд: 5 строк + Pow; текст короткий, ширины хватает
 static void grButtons() {
-  for (uint8_t i = 0; i < 5; i++) drawButton(10 + i * 92, 6, 88, 38, ROW_LBL[i], i == grSel ? C_GREEN : C_WHITE);
-  for (uint8_t i = 0; i < 7; i++) drawButton(10 + i * 64, GR_RB_Y, 60, 34, GR_LBL[i], i == grRange ? C_GREEN : C_WHITE);
+  for (uint8_t i = 0; i < 5; i++) drawButton(6 + i * 79, 6, 74, 38, ROW_LBL[i], !grPow && i == grSel ? C_GREEN : C_WHITE);
+  drawButton(6 + 5 * 79, 6, 74, 38, "Pow", grPow ? C_GREEN : C_WHITE);
+}
+
+static void grDrawYAxis() {                      // подписи шкалы: %/°C или Вт в режиме Pow
+  tft.setTextSize(1); tft.setTextColor(C_GREY, C_BLACK);
+  tft.fillRect(0, GP_Y - 10, 36, GP_H + 12, C_BLACK);
+  if (grPow) {
+    tft.setCursor(4, GP_Y - 2);             tft.print(GP_WATTS_MAX);
+    tft.setCursor(4, GP_Y + GP_H / 2 - 4);  tft.print(GP_WATTS_MAX / 2);
+    tft.setCursor(20, GP_Y + GP_H - 8);     tft.print("0");
+    tft.setCursor(2, GP_Y + GP_H + 6);      tft.print("W");
+  } else {
+    tft.setCursor(8, GP_Y - 2);            tft.print("100");
+    tft.setCursor(14, GP_Y + GP_H / 2 - 4); tft.print("50");
+    tft.setCursor(20, GP_Y + GP_H - 8);    tft.print("0");
+  }
 }
 
 static void grDrawAll() {
   tft.fillScreen(C_BLACK);
-  tft.setTextSize(1); tft.setTextColor(C_GREY, C_BLACK);
-  tft.setCursor(8, GP_Y - 2);            tft.print("100");
-  tft.setCursor(14, GP_Y + GP_H / 2 - 4); tft.print("50");
-  tft.setCursor(20, GP_Y + GP_H - 8);    tft.print("0");
+  grDrawYAxis();
   grButtons();
   drawButton(10, GR_BT_Y, 100, 44, "Back", C_YELLOW);
+  drawButton(GR_RANGE_X, GR_BT_Y, 100, 44, GR_LBL[grRange], C_WHITE);   // интервал: тап = следующий
 #if SD_EXPORT
   drawButton(120, GR_BT_Y, 100, 44, "SD", C_GREEN);
 #endif
   grLastVals = "#";
 }
 
-static void grValues() {                       // справа внизу: текущие значения выбранной строки или сообщение
+static bool pFresh(uint8_t k) { return pAt[k] != 0 && millis() - pAt[k] <= X_STALE_MS; }
+static String pFmt(uint8_t k) { return pFresh(k) ? (String((int)(pV[k] + 0.5f)) + "W") : String("--"); }
+
+static void grValues() {                       // справа внизу: текущие значения или сообщение
   String msg = (gMsgMs != 0 && millis() - gMsgMs < 6000UL) ? gMsg : String("");
+  String sig = msg + "|";
+  if (grPow) {
+    // мощность: 5 значений в цветах линий, две строки мелким шрифтом
+    static const uint16_t PCL[5] = {C_RED, C_YELLOW, C_GREY, C_CYAN, C_ORANGE};
+    for (uint8_t k = 0; k < 5; k++) sig += pFmt(k) + ";";
+    if (sig == grLastVals) return;
+    grLastVals = sig;
+    tft.fillRect(228, GR_BT_Y, 250, 44, C_BLACK);
+    if (msg.length()) {
+      tft.setTextSize(2); tft.setTextColor(C_YELLOW, C_BLACK);
+      tft.setCursor(232, GR_BT_Y + 14); tft.print(msg.substring(0, 19)); return;
+    }
+    tft.setTextSize(1);
+    tft.setCursor(232, GR_BT_Y + 8);
+    tft.setTextColor(PCL[0], C_BLACK); tft.print("SUM " + pFmt(0) + "  ");
+    tft.setTextColor(PCL[1], C_BLACK); tft.print("CPU " + pFmt(1) + "  ");
+    tft.setTextColor(PCL[2], C_BLACK); tft.print("DRAM " + pFmt(2));
+    tft.setCursor(232, GR_BT_Y + 24);
+    tft.setTextColor(PCL[3], C_BLACK); tft.print(String(GPU1_NAME) + " " + pFmt(3) + "  ");
+    tft.setTextColor(PCL[4], C_BLACK); tft.print(String(GPU2_NAME) + " " + pFmt(4));
+    return;
+  }
   String a = "", b = "";
   int8_t ts = ROW_TEMP[grSel], ld = ROW_LOAD[grSel];
   float tv[4] = {cpuTemp, gpuTemp, ssdTemp, p102Temp};
   if (ts >= 0 && tempAt[ts] != 0 && millis() - tempAt[ts] <= VAL_STALE_MS) a = String(tv[ts], 1) + "C";
   if (loadAt[ld] != 0 && millis() - loadAt[ld] <= VAL_STALE_MS) b = String((int)(loadV[ld] + 0.5f)) + "%";
-  String sig = msg + "|" + a + "|" + b;
+  sig += a + "|" + b;
   if (sig == grLastVals) return;
   grLastVals = sig;
   tft.fillRect(228, GR_BT_Y, 250, 44, C_BLACK);
@@ -1947,7 +2107,7 @@ static String sdExport() {
   SD.remove(fn);
   File f = SD.open(fn, FILE_WRITE);
   if (!f) return "SD open failed";
-  f.println("time,cpu_t,ti1_t,ssd_t,ti2_t,cpu_l,ti1_l,ssd_l,ti2_l,ram_l");
+  f.println("time,cpu_t,gpu1_t,ssd_t,gpu2_t,cpu_l,gpu1_l,ssd_l,gpu2_l,ram_l,psum_w,pcpu_w,pram_w,pgu1_w,pgu2_w");
   for (uint16_t i = 0; i < n; i++) {                            // от старого к новому
     uint16_t k = n - 1 - i;
     if (k >= hCnt[lv]) continue;
@@ -1963,7 +2123,8 @@ static String sdExport() {
     for (uint8_t sr = 0; sr < H_SER; sr++) {
       line += ',';
       uint8_t e = histGet(lv, k, sr);
-      if (e != 255) line += String(e / 2) + ((e & 1) ? ".5" : ".0");
+      if (sr >= POW_HIST_FIRST) { if (e != 255) line += String((int)(e / POW_HIST_SCALE + 0.5f)); }
+      else if (e != 255) line += String(e / 2) + ((e & 1) ? ".5" : ".0");
     }
     f.println(line);
   }
@@ -1989,10 +2150,10 @@ static void graphScreen() {
     if (!getTap(x, y)) continue;
     bool hit = false;
     for (uint8_t i = 0; i < 5; i++)
-      if (inRect(x, y, 10 + i * 92, 6, 88, 38)) { grSel = i; hit = true; }
-    for (uint8_t i = 0; i < 7; i++)
-      if (inRect(x, y, 10 + i * 64, GR_RB_Y, 60, 34)) { grRange = i; hit = true; }
-    if (hit) { grButtons(); redraw = true; grLastVals = "#"; continue; }
+      if (inRect(x, y, 6 + i * 79, 6, 74, 38)) { grSel = i; grPow = false; hit = true; }
+    if (inRect(x, y, 6 + 5 * 79, 6, 74, 38)) { grPow = !grPow; hit = true; }
+    if (inRect(x, y, GR_RANGE_X, GR_BT_Y, 100, 44)) { grRange = (grRange + 1) % 7; drawButton(GR_RANGE_X, GR_BT_Y, 100, 44, GR_LBL[grRange], C_WHITE); hit = true; }
+    if (hit) { grButtons(); grDrawYAxis(); redraw = true; grLastVals = "#"; continue; }
     if (inRect(x, y, 10, GR_BT_Y, 100, 44)) return;
 #if SD_EXPORT
     if (inRect(x, y, 120, GR_BT_Y, 100, 44)) {
@@ -2286,4 +2447,5 @@ void loop() {
     dirty = false;
     lastDrawMs = millis();
   }
+  if (badLen && millis() - badMs > 350) statusDraw();   // прокрутка имён упавших контейнеров чаще раза в секунду
 }
